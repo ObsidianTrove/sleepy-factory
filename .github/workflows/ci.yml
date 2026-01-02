@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Set up Python
+        run: ~/.local/bin/uv python install 3.14
+
+      - name: Sync (dev)
+        run: ~/.local/bin/uv sync --dev
+
+      - name: Ruff check
+        run: ~/.local/bin/uv run ruff check .
+
+      - name: Ruff format (check)
+        run: ~/.local/bin/uv run ruff format --check .
+
+      - name: Pytest
+        run: ~/.local/bin/uv run pytest -q

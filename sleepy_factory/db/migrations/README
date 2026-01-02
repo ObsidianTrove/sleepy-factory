@@ -1,0 +1,10 @@
+Alembic migrations live in this directory.
+
+- env.py configures Alembic to read DATABASE_URL from the project settings (.env).
+- versions/ contains migration history and should be committed.
+
+Generate a new migration:
+  uv run alembic revision --autogenerate -m "describe change"
+
+Apply migrations:
+  uv run alembic upgrade head
