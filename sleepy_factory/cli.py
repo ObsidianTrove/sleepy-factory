@@ -1,7 +1,6 @@
 import os
 import socket
 import threading
-import time
 from datetime import UTC, datetime
 
 from rich import print
@@ -131,7 +130,9 @@ def complete_job_stage(
     return True
 
 
-def run_worker_loop(stage: str, poll_seconds: float = 1.0, stop_event: threading.Event | None = None):
+def run_worker_loop(
+    stage: str, poll_seconds: float = 1.0, stop_event: threading.Event | None = None
+):
     if stop_event is None:
         stop_event = threading.Event()
 
@@ -256,9 +257,19 @@ def run_dev(orchestrator_poll: float = 1.0, recovery_poll: float = 5.0):
             kwargs={"poll_seconds": recovery_poll, "stop_event": stop_event},
             daemon=True,
         ),
-        threading.Thread(target=run_worker_loop, kwargs={"stage": "audio", "stop_event": stop_event}, daemon=True),
-        threading.Thread(target=run_worker_loop, kwargs={"stage": "visuals", "stop_event": stop_event}, daemon=True),
-        threading.Thread(target=run_worker_loop, kwargs={"stage": "render", "stop_event": stop_event}, daemon=True),
+        threading.Thread(
+            target=run_worker_loop, kwargs={"stage": "audio", "stop_event": stop_event}, daemon=True
+        ),
+        threading.Thread(
+            target=run_worker_loop,
+            kwargs={"stage": "visuals", "stop_event": stop_event},
+            daemon=True,
+        ),
+        threading.Thread(
+            target=run_worker_loop,
+            kwargs={"stage": "render", "stop_event": stop_event},
+            daemon=True,
+        ),
     ]
 
     print("[bold]Sleepy Factory dev mode starting[/bold] (Ctrl+C to stop)")
