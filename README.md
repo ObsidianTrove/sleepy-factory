@@ -1,133 +1,167 @@
 # Sleepy Factory
 
-A Python-first, Postgres-backed pipeline skeleton for a reliable “content factory” style workflow.
+Sleepy Factory is a Python-first, Postgres-backed pipeline skeleton for building a reliable “content factory” workflow.
 
-This repo is intentionally boring and dependable: the core primitives are a state-machine stored in Postgres, workers that claim work with row locks (`FOR UPDATE SKIP LOCKED`), and per-stage leases so jobs are safe to retry and recover.
+It is intentionally built around boring, production-proven primitives:
 
-Current stages:
-- `audio` → `visuals` → `render`
+- A **database-backed state machine** (Postgres is the source of truth)
+- **Concurrency-safe job claiming** using `SELECT ... FOR UPDATE SKIP LOCKED`
+- **Per-stage leases** to safely recover work after crashes, sleeps, or restarts
+- A small CLI (`sf`) you can run locally today and evolve into a distributed system later
 
-Key features:
-- Deterministic state transitions stored in Postgres (single source of truth)
-- Concurrent workers using `SKIP LOCKED` claiming
-- Per-stage leases (`audio_lease_*`, `visuals_lease_*`, `render_lease_*`)
-- Recovery loop that re-queues jobs with expired leases
-- Orchestrator loop that advances jobs through stages
-- `uv` for reproducible environments and a lockfile (`uv.lock`)
-- `ruff` for linting and formatting
+This repository is a foundation. The current implementation is a working pipeline simulator with real locking, real persistence, and real recovery logic. The next layers will add actual AI generation and media output.
+
+---
+
+## What this project is for
+
+The long-term goal is to automate end-to-end YouTube video generation (as much as possible) across multiple formats:
+
+- Long multi-hour “sleepy” videos
+- 15–20 minute longform informational videos
+- Shorts under 60 seconds
+
+This repo currently focuses on the reliability core: a state machine + workers + leases + recovery. It does not yet implement real AI generation or rendering.
+
+---
+
+## Current pipeline model
+
+Stages:
+
+1. `audio`
+2. `visuals`
+3. `render`
+
+Each stage has:
+
+- a status: `NEW`, `READY`, `RUNNING`, `DONE`, `ERROR`
+- a lease owner: `<stage>_lease_owner`
+- a lease expiry: `<stage>_lease_expires_at`
+
+The orchestrator owns the state transitions between stages. Workers only claim and complete their own stage.
+
+---
+
+## Key features
+
+- **Deterministic state transitions stored in Postgres**
+- **Concurrent worker claiming** with `SKIP LOCKED` so multiple workers can run safely
+- **Per-stage lease fields** so stuck jobs can be reclaimed safely
+- **Recovery loop** that re-queues work whose lease has expired
+- **Dev mode**: run the full orchestrator + workers in a single terminal (`sf dev`)
+- **Tooling**:
+  - `uv` for environments + lockfile (`uv.lock`)
+  - `ruff` for linting and formatting
+  - GitHub Actions CI to keep the repo clean
 
 ---
 
 ## Requirements
 
+- Windows + PowerShell (instructions are written for this setup)
 - Python 3.14
-- Docker Desktop (for local Postgres)
+- Docker Desktop
 - `uv` installed
 
 ---
 
-## Configuration
+## Repository safety and licensing
 
-This repo does not commit `.env`. Create a local `.env` from `.env.example`.
+This repository is proprietary.
+
+**No license is granted for use, copying, modification, or distribution.**  
+It is published for evaluation and portfolio demonstration purposes.
+
+See `LICENSE`.
+
+---
+
+## Step-by-step setup (Windows PowerShell)
+
+### 1) Clone the repo
+```powershell
+git clone https://github.com/ObsidianTrove/sleepy-factory.git
+cd sleepy-factory
+```
+
+### 2) Create your local `.env`
+This repo does not commit `.env`. Create it from the template:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Example `.env`:
+`.env.example` uses local Docker Compose Postgres:
 
 ```env
 DATABASE_URL=postgresql+psycopg://dev:dev@localhost:5432/sleepy
 ```
 
-Notes:
-- `DATABASE_URL` is required. If it is missing, commands will fail with a helpful error.
-- If you have `DATABASE_URL` set in your shell or Windows environment variables, it can override local expectations. You can clear it for the current PowerShell session with:
-
-```powershell
-Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue
-```
-
----
-
-## Quickstart (Windows PowerShell)
-
-### 1) Start Postgres
-From the repo root:
-
+### 3) Start Postgres (Docker Compose)
 ```powershell
 docker compose up -d
 docker compose ps
 ```
 
-### 2) Install dependencies with uv
-For running the pipeline:
+You should see a `postgres` container running.
+
+### 4) Install dependencies with uv
+Create a virtual environment and install dev dependencies:
 
 ```powershell
 uv venv
-uv sync
-```
-
-For development (includes Ruff):
-
-```powershell
 uv sync --dev
 ```
 
-### 3) Run database migrations
+### 5) Apply database migrations
 ```powershell
 uv run alembic upgrade head
 ```
 
-### 4) Run the pipeline (recommended: 5 terminals)
+Optional checks:
 
-Terminal 1 (orchestrator loop):
 ```powershell
-uv run sf orchestrator-loop
+uv run alembic current
+uv run alembic heads
 ```
 
-Terminal 2 (recovery loop):
+---
+
+## Running the pipeline
+
+### Recommended: Dev mode (one terminal)
+This runs:
+- orchestrator loop
+- recovery loop
+- audio worker
+- visuals worker
+- render worker
+
+In one VS Code terminal:
+
 ```powershell
-uv run sf recovery
+uv run sf dev
 ```
 
-Terminal 3 (audio worker):
-```powershell
-uv run sf worker --stage audio
-```
+Stop it with `Ctrl+C`.
 
-Terminal 4 (visuals worker):
-```powershell
-uv run sf worker --stage visuals
-```
-
-Terminal 5 (render worker):
-```powershell
-uv run sf worker --stage render
-```
-
-### 5) Create a job and watch it flow
-In a new terminal:
-
+### Create jobs (in a second terminal)
 ```powershell
 uv run sf new-job
 uv run sf list-jobs
 ```
 
-You should see the job progress stage-by-stage. Example output:
+You’ll see jobs move through the stage machine. A completed job will show:
 
-```
-<job-id>  audio=RUNNING(<host:pid>)  visuals=NEW(None)  render=NEW(None)  attempts=1
-```
-
-As workers finish:
-- `audio=DONE` triggers `visuals=READY`
-- `visuals=DONE` triggers `render=READY`
-- `render=DONE` completes the job
+- `audio=DONE`
+- `visuals=DONE`
+- `render=DONE`
+- `attempts=3` (one claim per stage)
 
 ---
 
-## Commands
+## CLI commands
 
 Create a new job:
 ```powershell
@@ -139,16 +173,13 @@ List recent jobs:
 uv run sf list-jobs --limit 20
 ```
 
-Run a worker for a specific stage:
-```powershell
-uv run sf worker --stage audio
-uv run sf worker --stage visuals
-uv run sf worker --stage render
-```
-
-Run orchestrator (single tick vs loop):
+Run the orchestrator once:
 ```powershell
 uv run sf orchestrator
+```
+
+Run orchestrator loop:
+```powershell
 uv run sf orchestrator-loop --poll 1.0
 ```
 
@@ -157,59 +188,48 @@ Run recovery loop:
 uv run sf recovery --poll 5.0
 ```
 
-Alembic helpers:
+Run a single stage worker:
 ```powershell
-uv run alembic current
-uv run alembic heads
-uv run alembic revision --autogenerate -m "your message"
-uv run alembic upgrade head
+uv run sf worker --stage audio
+uv run sf worker --stage visuals
+uv run sf worker --stage render
+```
+
+Run everything in one process (dev mode):
+```powershell
+uv run sf dev
 ```
 
 ---
 
-## Development
+## How it works (technical overview)
 
-Lint and format (Ruff):
-```powershell
-uv run ruff check . --fix
-uv run ruff format .
-```
+### Orchestrator: transitions only
+The orchestrator advances jobs through the pipeline:
 
-Check-only (CI style):
-```powershell
-uv run ruff check .
-uv run ruff format --check .
-```
+- `audio:   NEW → READY`
+- `visuals: NEW → READY` only when `audio=DONE`
+- `render:  NEW → READY` only when `visuals=DONE`
 
-Optional: Alembic post-write hooks  
-If enabled in `alembic.ini`, new migration files can be automatically linted and formatted after generation.
+Workers do not advance downstream stages. This makes stage transitions deterministic and centralized.
 
----
+### Workers: claim safely, then complete
+Each worker:
+1. Selects a `READY` job with `FOR UPDATE SKIP LOCKED`
+2. Sets stage `READY → RUNNING`
+3. Writes lease fields (`<stage>_lease_owner`, `<stage>_lease_expires_at`)
+4. Performs work outside the transaction
+5. Completes only if the lease owner still matches
 
-## How the pipeline works
+This prevents double-processing and supports horizontal scaling.
 
-### Orchestrator (state transitions)
-The orchestrator advances jobs by updating stage statuses in Postgres:
+### Recovery: self-healing
+If a machine crashes or sleeps during `RUNNING`, the job can be stuck.
 
-- `audio: NEW → READY`
-- `visuals: NEW → READY` (only when `audio=DONE`)
-- `render: NEW → READY` (only when `visuals=DONE`)
-
-Workers do not advance downstream stages. They only complete their stage. The orchestrator owns transitions.
-
-### Worker claiming (concurrency-safe)
-Workers claim jobs with:
-- `SELECT ... FOR UPDATE SKIP LOCKED`
-- mark stage `READY → RUNNING`
-- set a stage-specific lease (`<stage>_lease_owner`, `<stage>_lease_expires_at`)
-- do work outside the transaction
-- complete with a compare-and-set check (lease owner must match)
-
-This pattern allows multiple workers to run concurrently with no duplicate processing.
-
-### Recovery (self-healing)
-If a worker crashes or the machine sleeps, a job can be stuck in `RUNNING`.
-The recovery loop detects expired leases and re-queues that stage to `READY`.
+The recovery loop:
+- finds `RUNNING` stages with expired leases
+- re-queues them back to `READY`
+- clears the lease fields
 
 ---
 
@@ -217,24 +237,66 @@ The recovery loop detects expired leases and re-queues that stage to `READY`.
 
 ```
 sleepy_factory/
-  cli.py                 # CLI entrypoint and worker/orchestrator loops
-  config.py              # env/config loading (DATABASE_URL required)
+  cli.py                 # CLI entrypoint, orchestrator/workers, dev runner
+  config.py              # .env loading + required DATABASE_URL
   db/
-    models.py            # SQLAlchemy models
+    models.py            # SQLAlchemy models (jobs, enums, lease fields)
     session.py           # DB engine/session
-    migrations/          # Alembic migrations
-docker-compose.yml       # local Postgres
-pyproject.toml           # dependencies + tooling (uv + ruff)
-uv.lock                  # reproducible dependency lockfile
-.env.example             # environment template
+    migrations/          # Alembic env + versions
+.github/
+  workflows/ci.yml        # Ruff + pytest checks via uv
+docker-compose.yml        # local Postgres
+pyproject.toml            # dependencies + tooling config
+uv.lock                   # reproducible dependency lockfile
+.env.example              # environment template
+tests/                    # minimal test scaffolding (CI sanity)
 ```
 
 ---
 
-## Notes
+## Development workflow
 
-- This repo is a skeleton focused on reliability primitives first.
-- Real implementations add artifact paths, stage outputs, observability, and an upload stage.
+### Lint and format
+```powershell
+uv run ruff check . --fix
+uv run ruff format .
+```
+
+### CI-style checks
+```powershell
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q
+```
+
+### Creating migrations
+Autogenerate a migration after changing models:
+
+```powershell
+uv run alembic revision --autogenerate -m "describe change"
+```
+
+Apply migrations:
+
+```powershell
+uv run alembic upgrade head
+```
+
+---
+
+## Roadmap (high level)
+
+This repo is deliberately building from the bottom up:
+
+1. Reliability primitives (current)
+2. Artifact storage + stage outputs (paths, metadata, checksums)
+3. Observability (structured logs, metrics)
+4. Stage implementations:
+   - script + prompt generation
+   - audio synthesis
+   - visual generation
+   - video rendering
+   - publishing / upload automation
 
 ---
 
@@ -243,4 +305,4 @@ uv.lock                  # reproducible dependency lockfile
 Copyright (c) 2026 ObsidianTroveLLC. All rights reserved.
 
 This repository is proprietary. No license is granted for use, copying, modification, or distribution.
-
+See `LICENSE`.
