@@ -10,7 +10,9 @@ def _norm(p: str) -> str:
     return p.replace("\\", "/")
 
 
-def test_artifacts_write_creates_files_and_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_artifacts_write_creates_files_and_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Keep artifacts isolated per test run.
     monkeypatch.setattr(artifacts, "ARTIFACTS_ROOT", tmp_path / "artifacts", raising=True)
 
