@@ -4,13 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, but kept intentionally lightweight for a fast-moving codebase.
 
-## Unreleased
+## Version 0.1.1 - 2026-01-03
 
-### Documentation
-- Add public, portfolio-safe design notes under `docs/public/`
-- Update README to reference the design docs set
+### Added
+- New `script` pipeline stage with status and per-stage lease fields
+- Artifact system (`sleepy_factory/artifacts.py`) with per-job `manifest.json`
+- Script stage outputs (`script.md`, `script.json`) written under `./artifacts/<job_id>/`
+- Render stage can generate a real `final.mp4` when `ffmpeg` is available (fallback artifact when not)
 
-## 0.1.0 (2026-01-02)
+### Changed
+- Pipeline stage order is now `script -> audio -> visuals -> render`
+- `.gitignore` now excludes generated `artifacts/` output
+
+## Version 0.1.0 - 2026-01-02
 
 ### Added
 - Postgres-backed job state machine with stage statuses (`audio`, `visuals`, `render`)
@@ -18,7 +24,7 @@ The format is loosely based on Keep a Changelog, but kept intentionally lightwei
 - Per-stage leases (`<stage>_lease_owner`, `<stage>_lease_expires_at`) for crash-safe processing
 - Recovery loop to re-queue jobs with expired leases
 - Orchestrator loop to advance jobs between stages
-- `sf dev` command to run orchestrator, recovery, and workers in a single terminal (via `uv run sf dev`)
+- `uv run sf dev` command to run orchestrator, recovery, and workers in a single terminal
 
 ### Infrastructure
 - Docker Compose Postgres for local development (`docker-compose.yml`)

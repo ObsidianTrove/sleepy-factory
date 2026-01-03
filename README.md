@@ -1,15 +1,15 @@
 # Sleepy Factory
 
-Sleepy Factory is a Python-first, Postgres-backed pipeline skeleton for building a reliable “content factory” workflow.
+Sleepy Factory is a Python-first, Postgres-backed pipeline skeleton for building a reliable, distributed-friendly "content factory" workflow.
 
 It is intentionally built around boring, production-proven primitives:
 
-- A **database-backed state machine** (Postgres is the source of truth)
-- **Concurrency-safe job claiming** using `SELECT ... FOR UPDATE SKIP LOCKED`
-- **Per-stage leases** to safely recover work after crashes, sleeps, or restarts
+- A database-backed state machine (Postgres is the source of truth)
+- Concurrency-safe job claiming using `SELECT ... FOR UPDATE SKIP LOCKED`
+- Per-stage leases to safely recover work after crashes, sleeps, or restarts
 - A small CLI (`sf`) you can run locally today and evolve into a distributed system later
 
-This repository is a foundation. The current implementation is a working pipeline simulator with real locking, real persistence, and real recovery logic. The next layers will add actual AI generation and media output.
+This repository is a foundation. The current implementation is a working pipeline simulator with real locking, real persistence, real recovery logic, and real on-disk artifacts. The next layers will add actual AI generation and media output.
 
 ---
 
@@ -17,21 +17,22 @@ This repository is a foundation. The current implementation is a working pipelin
 
 The long-term goal is to automate end-to-end YouTube video generation (as much as possible) across multiple formats:
 
-- Long multi-hour “sleepy” videos
-- 15–20 minute longform informational videos
-- Shorts under 60 seconds
+- Long multi-hour "sleepy" videos
+- 15 to 20 minute long-form informational videos
+- Short-form content
 
-This repo currently focuses on the reliability core: a state machine + workers + leases + recovery. It does not yet implement real AI generation or rendering.
+This repo currently focuses on the reliability core: a state machine + orchestrator + workers + leases + recovery + artifact tracking. It does not yet implement real AI generation for audio or visuals.
 
 ---
 
 ## Current pipeline model
 
-Stages:
+Stages (in order):
 
-1. `audio`
-2. `visuals`
-3. `render`
+1. `script`
+2. `audio`
+3. `visuals`
+4. `render`
 
 Each stage has:
 
@@ -39,36 +40,36 @@ Each stage has:
 - a lease owner: `<stage>_lease_owner`
 - a lease expiry: `<stage>_lease_expires_at`
 
-The orchestrator owns the state transitions between stages. Workers only claim and complete their own stage.
+The orchestrator owns transitions between stages. Workers only claim and complete their own stage.
+
+---
+
+## Artifacts and outputs
+
+Each job writes outputs to the local `./artifacts/` directory:
+
+- `artifacts/<job_id>/manifest.json` is the single source of truth for produced files
+- each stage writes to `artifacts/<job_id>/<stage>/...`
+
+The `artifacts/` directory is intentionally git-ignored. It is generated output and can become very large (especially MP4s).
+
+Current outputs:
+- `script` writes `script.md` and `script.json`
+- `render` writes `final.mp4` if `ffmpeg` is installed, otherwise a small fallback file describing what is missing
 
 ---
 
 ## Key features
 
-- **Deterministic state transitions stored in Postgres**
-- **Concurrent worker claiming** with `SKIP LOCKED` so multiple workers can run safely
-- **Per-stage lease fields** so stuck jobs can be reclaimed safely
-- **Recovery loop** that re-queues work whose lease has expired
-- **Dev mode**: run the full orchestrator + workers in a single terminal (`sf dev`)
-- **Tooling**:
+- Deterministic state transitions stored in Postgres
+- Concurrent worker claiming with `SKIP LOCKED` so multiple workers can run safely
+- Per-stage lease fields so stuck jobs can be reclaimed safely
+- Recovery loop that re-queues work whose lease has expired
+- Dev mode: run orchestrator + recovery + workers in a single terminal (`sf dev`)
+- Tooling:
   - `uv` for environments + lockfile (`uv.lock`)
   - `ruff` for linting and formatting
   - GitHub Actions CI to keep the repo clean
-
----
-
-## Design docs (public)
-
-This repo includes portfolio-safe design notes under `docs/public/`. They explain the intended architecture and reliability model, while intentionally omitting proprietary prompt packs, detailed operational runbooks, and unit economics.
-
-Start here:
-
-- `docs/public/00_overview.md`
-- `docs/public/01_architecture.md`
-- `docs/public/02_state_machine_and_leases.md`
-- `docs/public/03_stage_contracts.md`
-- `docs/public/04_compliance_overview.md`
-- `docs/public/05_cost_and_scaling_overview.md`
 
 ---
 
@@ -78,6 +79,7 @@ Start here:
 - Python 3.14
 - Docker Desktop
 - `uv` installed
+- `ffmpeg` (optional, only needed to generate `final.mp4`)
 
 ---
 
@@ -85,7 +87,7 @@ Start here:
 
 This repository is proprietary.
 
-**No license is granted for use, copying, modification, or distribution.**  
+No license is granted for use, copying, modification, or distribution.
 It is published for evaluation and portfolio demonstration purposes.
 
 See `LICENSE`.
@@ -149,6 +151,7 @@ uv run alembic heads
 This runs:
 - orchestrator loop
 - recovery loop
+- script worker
 - audio worker
 - visuals worker
 - render worker
@@ -167,12 +170,21 @@ uv run sf new-job
 uv run sf list-jobs
 ```
 
-You’ll see jobs move through the stage machine. A completed job will show:
+A completed job will show all stages as `DONE`.
 
-- `audio=DONE`
-- `visuals=DONE`
-- `render=DONE`
-- `attempts=3` (one claim per stage)
+---
+
+## ffmpeg (optional)
+
+If you want `render/final.mp4` to be generated, install ffmpeg and ensure it is on your PATH.
+
+After installation, verify:
+
+```powershell
+ffmpeg -version
+```
+
+If ffmpeg is not installed, the render stage will still complete and will write a small fallback artifact in `artifacts/<job_id>/render/` describing what is missing.
 
 ---
 
@@ -205,6 +217,7 @@ uv run sf recovery --poll 5.0
 
 Run a single stage worker:
 ```powershell
+uv run sf worker --stage script
 uv run sf worker --stage audio
 uv run sf worker --stage visuals
 uv run sf worker --stage render
@@ -222,16 +235,17 @@ uv run sf dev
 ### Orchestrator: transitions only
 The orchestrator advances jobs through the pipeline:
 
-- `audio:   NEW → READY`
-- `visuals: NEW → READY` only when `audio=DONE`
-- `render:  NEW → READY` only when `visuals=DONE`
+- `script:  NEW -> READY`
+- `audio:   NEW -> READY` only when `script=DONE`
+- `visuals: NEW -> READY` only when `audio=DONE`
+- `render:  NEW -> READY` only when `visuals=DONE`
 
 Workers do not advance downstream stages. This makes stage transitions deterministic and centralized.
 
 ### Workers: claim safely, then complete
 Each worker:
 1. Selects a `READY` job with `FOR UPDATE SKIP LOCKED`
-2. Sets stage `READY → RUNNING`
+2. Sets stage `READY -> RUNNING`
 3. Writes lease fields (`<stage>_lease_owner`, `<stage>_lease_expires_at`)
 4. Performs work outside the transaction
 5. Completes only if the lease owner still matches
@@ -251,16 +265,9 @@ The recovery loop:
 ## Project structure
 
 ```
-docs/
-  public/
-    00_overview.md
-    01_architecture.md
-    02_state_machine_and_leases.md
-    03_stage_contracts.md
-    04_compliance_overview.md
-    05_cost_and_scaling_overview.md
 sleepy_factory/
   cli.py                 # CLI entrypoint, orchestrator/workers, dev runner
+  artifacts.py           # artifact helpers + per-job manifest.json
   config.py              # .env loading + required DATABASE_URL
   db/
     models.py            # SQLAlchemy models (jobs, enums, lease fields)
@@ -312,14 +319,14 @@ uv run alembic upgrade head
 This repo is deliberately building from the bottom up:
 
 1. Reliability primitives (current)
-2. Artifact storage + stage outputs (paths, metadata, checksums)
+2. Artifact storage + stage outputs (in progress)
 3. Observability (structured logs, metrics)
 4. Stage implementations:
-   - script + prompt generation
+   - prompt and script generation
    - audio synthesis
    - visual generation
    - video rendering
-   - publishing / upload automation
+   - publishing and upload automation
 
 ---
 
