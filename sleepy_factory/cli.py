@@ -313,7 +313,9 @@ def complete_job_stage(
     return True
 
 
-def run_worker_loop(stage: str, poll_seconds: float = 1.0, stop_event: threading.Event | None = None):
+def run_worker_loop(
+    stage: str, poll_seconds: float = 1.0, stop_event: threading.Event | None = None
+):
     if stop_event is None:
         stop_event = threading.Event()
 
@@ -338,7 +340,9 @@ def run_worker_loop(stage: str, poll_seconds: float = 1.0, stop_event: threading
             err = f"{type(exc).__name__}: {exc}"
 
         with SessionLocal() as db:
-            ok = complete_job_stage(db, job.id, owner=owner, stage=stage, success=success, error=err)
+            ok = complete_job_stage(
+                db, job.id, owner=owner, stage=stage, success=success, error=err
+            )
             print(f"[{stage}] Completed job {job.id}: {ok} (success={success})")
 
 
