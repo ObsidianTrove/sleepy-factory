@@ -2,11 +2,7 @@
 
 Sleepy Factory is a Python-first, Postgres-backed pipeline skeleton for building a reliable “content factory” workflow.
 
-Design notes live in docs/public/
-
-“Full internal runbooks/specs are maintained privately.
-
-Sleepy Factory is intentionally built around boring, production-proven primitives:
+It is intentionally built around boring, production-proven primitives:
 
 - A **database-backed state machine** (Postgres is the source of truth)
 - **Concurrency-safe job claiming** using `SELECT ... FOR UPDATE SKIP LOCKED`
@@ -58,6 +54,21 @@ The orchestrator owns the state transitions between stages. Workers only claim a
   - `uv` for environments + lockfile (`uv.lock`)
   - `ruff` for linting and formatting
   - GitHub Actions CI to keep the repo clean
+
+---
+
+## Design docs (public)
+
+This repo includes portfolio-safe design notes under `docs/public/`. They explain the intended architecture and reliability model, while intentionally omitting proprietary prompt packs, detailed operational runbooks, and unit economics.
+
+Start here:
+
+- `docs/public/00_overview.md`
+- `docs/public/01_architecture.md`
+- `docs/public/02_state_machine_and_leases.md`
+- `docs/public/03_stage_contracts.md`
+- `docs/public/04_compliance_overview.md`
+- `docs/public/05_cost_and_scaling_overview.md`
 
 ---
 
@@ -240,6 +251,14 @@ The recovery loop:
 ## Project structure
 
 ```
+docs/
+  public/
+    00_overview.md
+    01_architecture.md
+    02_state_machine_and_leases.md
+    03_stage_contracts.md
+    04_compliance_overview.md
+    05_cost_and_scaling_overview.md
 sleepy_factory/
   cli.py                 # CLI entrypoint, orchestrator/workers, dev runner
   config.py              # .env loading + required DATABASE_URL

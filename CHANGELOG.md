@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, but kept intentionally lightweight for a fast-moving codebase.
 
+## Unreleased
+
+### Documentation
+- Add public, portfolio-safe design notes under `docs/public/`
+- Update README to reference the design docs set
+
 ## 0.1.0 (2026-01-02)
 
 ### Added
