@@ -73,7 +73,7 @@ def write_bytes(job_id: str, stage: str, filename: str, data: bytes, kind: str) 
     rec = ArtifactRecord(
         stage=stage,
         kind=kind,
-        relpath=str(p.relative_to(job_dir(job_id))),
+        relpath=p.relative_to(job_dir(job_id)).as_posix(),
         bytes=len(data),
         sha256=_sha256(data),
         created_at=datetime.now(UTC).isoformat(),

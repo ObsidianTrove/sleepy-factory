@@ -1,27 +1,23 @@
+from __future__ import annotations
+
 import os
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 from datetime import UTC, datetime
+from typing import Final
 
 from rich import print
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
-from sleepy_factory.artifacts import (
-    ArtifactRecord,
-    append_manifest,
-    job_dir,
-    stage_dir,
-    write_json,
-    write_text,
-    write_bytes,
-)
+from sleepy_factory.artifacts import ARTIFACTS_ROOT, write_bytes, write_json, write_text
 from sleepy_factory.db.models import Job, StageStatus
 from sleepy_factory.db.session import SessionLocal
 
-STAGES = ["script", "audio", "visuals", "render"]
+STAGES: Final[list[str]] = ["script", "audio", "visuals", "render"]
 
 
 def stage_fields(stage: str) -> tuple[str, str, str]:
@@ -33,53 +29,56 @@ def stage_fields(stage: str) -> tuple[str, str, str]:
 
 
 def orchestrator_tick(db: Session) -> int:
+    """
+    Orchestrator owns stage transitions:
+
+    script:  NEW -> READY
+    audio:   NEW -> READY (only when script DONE)
+    visuals: NEW -> READY (only when audio DONE)
+    render:  NEW -> READY (only when visuals DONE)
+    """
     moved = 0
 
     # script: NEW -> READY
-    q = select(Job).where(Job.script_status == StageStatus.NEW).limit(50)
-    jobs = list(db.execute(q).scalars())
+    jobs = list(
+        db.execute(select(Job).where(Job.script_status == StageStatus.NEW).limit(50)).scalars()
+    )
     for job in jobs:
         job.script_status = StageStatus.READY
         moved += 1
 
     # audio: gate on script DONE
-    q = (
-        select(Job)
-        .where(
-            Job.script_status == StageStatus.DONE,
-            Job.audio_status == StageStatus.NEW,
-        )
-        .limit(50)
+    jobs = list(
+        db.execute(
+            select(Job)
+            .where(Job.script_status == StageStatus.DONE, Job.audio_status == StageStatus.NEW)
+            .limit(50)
+        ).scalars()
     )
-    jobs = list(db.execute(q).scalars())
     for job in jobs:
         job.audio_status = StageStatus.READY
         moved += 1
 
     # visuals: gate on audio DONE
-    q = (
-        select(Job)
-        .where(
-            Job.audio_status == StageStatus.DONE,
-            Job.visuals_status == StageStatus.NEW,
-        )
-        .limit(50)
+    jobs = list(
+        db.execute(
+            select(Job)
+            .where(Job.audio_status == StageStatus.DONE, Job.visuals_status == StageStatus.NEW)
+            .limit(50)
+        ).scalars()
     )
-    jobs = list(db.execute(q).scalars())
     for job in jobs:
         job.visuals_status = StageStatus.READY
         moved += 1
 
     # render: gate on visuals DONE
-    q = (
-        select(Job)
-        .where(
-            Job.visuals_status == StageStatus.DONE,
-            Job.render_status == StageStatus.NEW,
-        )
-        .limit(50)
+    jobs = list(
+        db.execute(
+            select(Job)
+            .where(Job.visuals_status == StageStatus.DONE, Job.render_status == StageStatus.NEW)
+            .limit(50)
+        ).scalars()
     )
-    jobs = list(db.execute(q).scalars())
     for job in jobs:
         job.render_status = StageStatus.READY
         moved += 1
@@ -119,6 +118,9 @@ def claim_one_job_for_stage(db: Session, stage: str, lease_minutes: int = 10) ->
 
 
 def run_stage_work(job_id: str, stage: str) -> None:
+    """
+    Stage work writes artifacts into artifacts/<job_id>/<stage>/ and records them into manifest.json.
+    """
     if stage == "script":
         script_md = (
             "# Video Script\n\n"
@@ -157,46 +159,49 @@ def run_stage_work(job_id: str, stage: str) -> None:
                 job_id,
                 "render",
                 "render_plan.json",
-                {
-                    "status": "needs_ffmpeg",
-                    "output": "final.mp4",
-                    "placeholder": "final.txt",
-                },
+                {"status": "needs_ffmpeg", "output": "final.mp4", "placeholder": "final.txt"},
                 kind="render_plan",
             )
             return
 
+        # Create video into a temp file, then record it through write_bytes (to get manifest + checksum).
+        with tempfile.TemporaryDirectory() as td:
+            tmp_out = os.path.join(td, "final.mp4")
 
-        out_dir = stage_dir(job_id, "render")
-        out_path = out_dir / "final.mp4"
+            cmd = [
+                ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=1280x720:d=6",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-shortest",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                tmp_out,
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
 
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=c=black:s=1280x720:d=6",
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=r=48000:cl=stereo",
-            "-shortest",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            str(out_path),
-        ]
-        subprocess.run(cmd, check=True)
-
-        data = out_path.read_bytes()
-        write_bytes(job_id, "render", "final.mp4", data, kind="final_video")
+            data = open(tmp_out, "rb").read()
+            write_bytes(job_id, "render", "final.mp4", data, kind="final_video")
+            write_json(
+                job_id,
+                "render",
+                "render_plan.json",
+                {"status": "ok", "output": "final.mp4", "duration_seconds": 6},
+                kind="render_plan",
+            )
         return
 
-    # audio + visuals: still simulated for now
+    # audio + visuals are simulated for now (no outputs)
     return
 
 
@@ -249,7 +254,7 @@ def run_worker_loop(
 
         print(f"[{stage}] Claimed job {job.id} (attempt {job.attempts})")
 
-        # Do work outside the DB transaction
+        # Work happens outside DB transaction.
         try:
             run_stage_work(str(job.id), stage)
             success = True
@@ -300,16 +305,17 @@ def recover_expired_leases(db: Session, limit: int = 50) -> int:
     for job in jobs:
         for stage in STAGES:
             status_field, lease_owner_field, lease_expires_field = stage_fields(stage)
+            if getattr(job, status_field) != StageStatus.RUNNING:
+                continue
 
-            if getattr(job, status_field) == StageStatus.RUNNING:
-                exp = getattr(job, lease_expires_field)
-                if exp is not None and exp < now:
-                    setattr(job, status_field, StageStatus.READY)
-                    job.last_error = f"lease expired, re-queued {stage}"
-                    setattr(job, lease_owner_field, None)
-                    setattr(job, lease_expires_field, None)
-                    recovered += 1
-                    break
+            exp = getattr(job, lease_expires_field)
+            if exp is not None and exp < now:
+                setattr(job, status_field, StageStatus.READY)
+                job.last_error = f"lease expired, re-queued {stage}"
+                setattr(job, lease_owner_field, None)
+                setattr(job, lease_expires_field, None)
+                recovered += 1
+                break
 
     db.commit()
     return recovered
@@ -357,6 +363,15 @@ def list_jobs(limit: int = 20):
         )
 
 
+def clean_artifacts() -> None:
+    if not ARTIFACTS_ROOT.exists():
+        print(f"[green]No artifacts directory found:[/green] {ARTIFACTS_ROOT}")
+        return
+
+    shutil.rmtree(ARTIFACTS_ROOT)
+    print(f"[green]Deleted artifacts directory:[/green] {ARTIFACTS_ROOT}")
+
+
 def run_dev(orchestrator_poll: float = 1.0, recovery_poll: float = 5.0):
     stop_event = threading.Event()
 
@@ -371,25 +386,16 @@ def run_dev(orchestrator_poll: float = 1.0, recovery_poll: float = 5.0):
             kwargs={"poll_seconds": recovery_poll, "stop_event": stop_event},
             daemon=True,
         ),
-        threading.Thread(
-            target=run_worker_loop,
-            kwargs={"stage": "script", "stop_event": stop_event},
-            daemon=True,
-        ),
-        threading.Thread(
-            target=run_worker_loop, kwargs={"stage": "audio", "stop_event": stop_event}, daemon=True
-        ),
-        threading.Thread(
-            target=run_worker_loop,
-            kwargs={"stage": "visuals", "stop_event": stop_event},
-            daemon=True,
-        ),
-        threading.Thread(
-            target=run_worker_loop,
-            kwargs={"stage": "render", "stop_event": stop_event},
-            daemon=True,
-        ),
     ]
+
+    for stage in STAGES:
+        threads.append(
+            threading.Thread(
+                target=run_worker_loop,
+                kwargs={"stage": stage, "stop_event": stop_event},
+                daemon=True,
+            )
+        )
 
     print("[bold]Sleepy Factory dev mode starting[/bold] (Ctrl+C to stop)")
     for t in threads:
@@ -432,6 +438,8 @@ def main():
     p_dev.add_argument("--orchestrator-poll", type=float, default=1.0)
     p_dev.add_argument("--recovery-poll", type=float, default=5.0)
 
+    sub.add_parser("clean-artifacts")
+
     args = parser.parse_args()
 
     if args.cmd == "dev":
@@ -462,4 +470,8 @@ def main():
 
     if args.cmd == "worker":
         run_worker_loop(stage=args.stage)
+        return
+
+    if args.cmd == "clean-artifacts":
+        clean_artifacts()
         return

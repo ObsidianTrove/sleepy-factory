@@ -5,8 +5,26 @@ on:
   pull_request:
 
 jobs:
-  lint-and-test:
+  test:
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dev
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: sleepy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U dev -d sleepy"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    env:
+      DATABASE_URL: postgresql+psycopg://dev:dev@localhost:5432/sleepy
 
     steps:
       - uses: actions/checkout@v4
@@ -14,10 +32,7 @@ jobs:
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
-      - name: Set up Python
-        run: ~/.local/bin/uv python install 3.14
-
-      - name: Sync (dev)
+      - name: Sync
         run: ~/.local/bin/uv sync --dev
 
       - name: Ruff check
@@ -25,6 +40,9 @@ jobs:
 
       - name: Ruff format (check)
         run: ~/.local/bin/uv run ruff format --check .
+
+      - name: Run migrations
+        run: ~/.local/bin/uv run alembic upgrade head
 
       - name: Pytest
         run: ~/.local/bin/uv run pytest -q
