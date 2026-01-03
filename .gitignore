@@ -34,3 +34,6 @@ docs/internal/
 
 # Alembic
 *.db
+
+# Generated artifacts (local outputs)
+artifacts/

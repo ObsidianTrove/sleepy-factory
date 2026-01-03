@@ -1,5 +1,7 @@
 import os
+import shutil
 import socket
+import subprocess
 import threading
 from datetime import UTC, datetime
 
@@ -7,10 +9,19 @@ from rich import print
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
+from sleepy_factory.artifacts import (
+    ArtifactRecord,
+    append_manifest,
+    job_dir,
+    stage_dir,
+    write_json,
+    write_text,
+    write_bytes,
+)
 from sleepy_factory.db.models import Job, StageStatus
 from sleepy_factory.db.session import SessionLocal
 
-STAGES = ["audio", "visuals", "render"]
+STAGES = ["script", "audio", "visuals", "render"]
 
 
 def stage_fields(stage: str) -> tuple[str, str, str]:
@@ -22,16 +33,24 @@ def stage_fields(stage: str) -> tuple[str, str, str]:
 
 
 def orchestrator_tick(db: Session) -> int:
-    """
-    Orchestrator:
-    - audio:   NEW -> READY
-    - visuals: when audio DONE, visuals NEW -> READY
-    - render:  when visuals DONE, render NEW -> READY
-    """
     moved = 0
 
-    # audio: NEW -> READY
-    q = select(Job).where(Job.audio_status == StageStatus.NEW).limit(50)
+    # script: NEW -> READY
+    q = select(Job).where(Job.script_status == StageStatus.NEW).limit(50)
+    jobs = list(db.execute(q).scalars())
+    for job in jobs:
+        job.script_status = StageStatus.READY
+        moved += 1
+
+    # audio: gate on script DONE
+    q = (
+        select(Job)
+        .where(
+            Job.script_status == StageStatus.DONE,
+            Job.audio_status == StageStatus.NEW,
+        )
+        .limit(50)
+    )
     jobs = list(db.execute(q).scalars())
     for job in jobs:
         job.audio_status = StageStatus.READY
@@ -99,6 +118,88 @@ def claim_one_job_for_stage(db: Session, stage: str, lease_minutes: int = 10) ->
     return job
 
 
+def run_stage_work(job_id: str, stage: str) -> None:
+    if stage == "script":
+        script_md = (
+            "# Video Script\n\n"
+            "## Hook\n"
+            "Write a short hook here.\n\n"
+            "## Main Points\n"
+            "1. Point one\n"
+            "2. Point two\n"
+            "3. Point three\n\n"
+            "## Outro\n"
+            "Closing wrap-up.\n"
+        )
+        script_obj = {
+            "version": "0.1",
+            "sections": [
+                {"name": "hook", "text": "Write a short hook here."},
+                {"name": "main_points", "bullets": ["Point one", "Point two", "Point three"]},
+                {"name": "outro", "text": "Closing wrap-up."},
+            ],
+        }
+        write_text(job_id, "script", "script.md", script_md, kind="script_markdown")
+        write_json(job_id, "script", "script.json", script_obj, kind="script_structured")
+        return
+
+    if stage == "render":
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            write_text(
+                job_id,
+                "render",
+                "final.txt",
+                "ffmpeg not found. Install ffmpeg to generate final.mp4.\n",
+                kind="final_output_notice",
+            )
+            write_json(
+                job_id,
+                "render",
+                "render_plan.json",
+                {
+                    "status": "needs_ffmpeg",
+                    "output": "final.mp4",
+                    "placeholder": "final.txt",
+                },
+                kind="render_plan",
+            )
+            return
+
+
+        out_dir = stage_dir(job_id, "render")
+        out_path = out_dir / "final.mp4"
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=1280x720:d=6",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo",
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(out_path),
+        ]
+        subprocess.run(cmd, check=True)
+
+        data = out_path.read_bytes()
+        write_bytes(job_id, "render", "final.mp4", data, kind="final_video")
+        return
+
+    # audio + visuals: still simulated for now
+    return
+
+
 def complete_job_stage(
     db: Session,
     job_id,
@@ -147,11 +248,21 @@ def run_worker_loop(
                 continue
 
         print(f"[{stage}] Claimed job {job.id} (attempt {job.attempts})")
-        stop_event.wait(2.0)
+
+        # Do work outside the DB transaction
+        try:
+            run_stage_work(str(job.id), stage)
+            success = True
+            err: str | None = None
+        except Exception as exc:  # noqa: BLE001
+            success = False
+            err = f"{type(exc).__name__}: {exc}"
 
         with SessionLocal() as db:
-            ok = complete_job_stage(db, job.id, owner=owner, stage=stage, success=True)
-            print(f"[{stage}] Completed job {job.id}: {ok}")
+            ok = complete_job_stage(
+                db, job.id, owner=owner, stage=stage, success=success, error=err
+            )
+            print(f"[{stage}] Completed job {job.id}: {ok} (success={success})")
 
 
 def run_orchestrator_loop(poll_seconds: float = 1.0, stop_event: threading.Event | None = None):
@@ -224,7 +335,9 @@ def create_new_job():
         db.commit()
         db.refresh(job)
         print(
-            f"Created job {job.id} (audio={job.audio_status}, visuals={job.visuals_status}, render={job.render_status})"
+            "Created job "
+            f"{job.id} (script={job.script_status}, audio={job.audio_status}, visuals={job.visuals_status}, "
+            f"render={job.render_status})"
         )
 
 
@@ -236,6 +349,7 @@ def list_jobs(limit: int = 20):
     for j in jobs:
         print(
             f"{j.id}  "
+            f"script={j.script_status}({j.script_lease_owner})  "
             f"audio={j.audio_status}({j.audio_lease_owner})  "
             f"visuals={j.visuals_status}({j.visuals_lease_owner})  "
             f"render={j.render_status}({j.render_lease_owner})  "
@@ -255,6 +369,11 @@ def run_dev(orchestrator_poll: float = 1.0, recovery_poll: float = 5.0):
         threading.Thread(
             target=run_recovery_loop,
             kwargs={"poll_seconds": recovery_poll, "stop_event": stop_event},
+            daemon=True,
+        ),
+        threading.Thread(
+            target=run_worker_loop,
+            kwargs={"stage": "script", "stop_event": stop_event},
             daemon=True,
         ),
         threading.Thread(
@@ -304,7 +423,7 @@ def main():
     p_oloop.add_argument("--poll", type=float, default=1.0)
 
     p_worker = sub.add_parser("worker")
-    p_worker.add_argument("--stage", choices=["audio", "visuals", "render"], default="audio")
+    p_worker.add_argument("--stage", choices=STAGES, default="script")
 
     p_rec = sub.add_parser("recovery")
     p_rec.add_argument("--poll", type=float, default=5.0)
