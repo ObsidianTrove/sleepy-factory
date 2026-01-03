@@ -1,36 +1,33 @@
-import socket
-import time
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 
-try:
-    import sleepy_factory.artifacts as artifacts
-    from sleepy_factory.cli import (
-        STAGES,
-        claim_one_job_for_stage,
-        complete_job_stage,
-        orchestrator_tick,
-        run_stage_work,
-    )
-    from sleepy_factory.db.models import Job, StageStatus
-    from sleepy_factory.db.session import SessionLocal
-except Exception as exc:  # pragma: no cover
-    pytest.skip(str(exc), allow_module_level=True)
+import sleepy_factory.artifacts as artifacts
+from sleepy_factory.cli import complete_job_stage, orchestrator_tick, run_stage_work, stage_fields
+from sleepy_factory.db.models import Job, StageStatus
+from sleepy_factory.db.session import SessionLocal
+
+pytestmark = pytest.mark.smoke
 
 
-def _owner_for(stage: str) -> str:
-    # Must match the owner string created in claim_one_job_for_stage()
-    import os
-
-    return f"{socket.gethostname()}:{os.getpid()}:{stage}"
+def _norm(p: str) -> str:
+    return p.replace("\\", "/")
 
 
-def test_full_pipeline_reaches_done(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Keep artifacts isolated per test run
-    monkeypatch.setattr(artifacts, "ARTIFACTS_ROOT", tmp_path / "artifacts")
+def test_full_pipeline_reaches_done_and_writes_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Keep artifacts isolated per test run.
+    monkeypatch.setattr(artifacts, "ARTIFACTS_ROOT", tmp_path / "artifacts", raising=True)
 
-    # Create a fresh job
+    # If you explicitly run smoke tests, DB should be up. Fail loudly if not.
+    with SessionLocal() as db:
+        db.execute(text("SELECT 1"))
+
+    # Create a fresh job row for this test.
     with SessionLocal() as db:
         job = Job()
         db.add(job)
@@ -38,63 +35,75 @@ def test_full_pipeline_reaches_done(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         db.refresh(job)
         job_id = job.id
 
-    # Drive the pipeline to completion with a bounded loop
-    deadline = time.time() + 20.0  # seconds
-    while time.time() < deadline:
-        # Move NEW -> READY transitions
+    try:
+        # Move script NEW -> READY (and possibly other jobs too, but we only act on ours below).
         with SessionLocal() as db:
             orchestrator_tick(db)
 
-        progressed = False
+        # Walk stages and force a deterministic claim/complete cycle for OUR job.
+        for stage in ("script", "audio", "visuals", "render"):
+            status_field, lease_owner_field, lease_expires_field = stage_fields(stage)
+            owner = f"pytest:{os.getpid()}:{stage}"
+            now = datetime.now(UTC)
 
-        # For each stage, try to claim one job and complete it
-        for stage in STAGES:
+            # Ensure the stage becomes READY for this job.
             with SessionLocal() as db:
-                claimed = claim_one_job_for_stage(db, stage=stage, lease_minutes=1)
-            if not claimed:
-                continue
+                j = db.get(Job, job_id)
+                assert j is not None
 
-            progressed = True
+                if getattr(j, status_field) == StageStatus.NEW:
+                    orchestrator_tick(db)
+                    db.refresh(j)
 
-            # Do stage work outside the transaction
-            run_stage_work(str(claimed.id), stage)
+                assert getattr(j, status_field) == StageStatus.READY
 
-            # Complete with compare-and-set
+                # "Claim" only this job (avoid claiming other READY jobs).
+                setattr(j, status_field, StageStatus.RUNNING)
+                setattr(j, lease_owner_field, owner)
+                setattr(j, lease_expires_field, Job.new_lease_expiry(now, minutes=10))
+                j.attempts += 1
+                db.commit()
+
+            # Produce artifacts for this stage (no DB session held).
+            run_stage_work(str(job_id), stage)
+
+            # Complete via the same CAS logic used by workers.
             with SessionLocal() as db:
-                ok = complete_job_stage(
-                    db,
-                    claimed.id,
-                    owner=_owner_for(stage),
-                    stage=stage,
-                    success=True,
-                )
-            assert ok, f"Failed to complete stage {stage}"
+                ok = complete_job_stage(db, job_id, owner=owner, stage=stage, success=True)
+                assert ok is True
+                orchestrator_tick(db)
 
-        # Check if done
+        # Final assertions
         with SessionLocal() as db:
-            cur = db.get(Job, job_id)
-            assert cur is not None
+            j = db.get(Job, job_id)
+            assert j is not None
+            assert j.script_status == StageStatus.DONE
+            assert j.audio_status == StageStatus.DONE
+            assert j.visuals_status == StageStatus.DONE
+            assert j.render_status == StageStatus.DONE
 
-            if all(getattr(cur, f"{s}_status") == StageStatus.DONE for s in STAGES):
-                # Minimal sanity: attempts should be at least one per stage (may be higher if retries happen)
-                assert cur.attempts >= len(STAGES)
-                break
+        # Artifacts assertions
+        manifest = artifacts.load_manifest(str(job_id))
+        kinds = {a["kind"] for a in manifest["artifacts"]}
+        relpaths = {_norm(a["relpath"]) for a in manifest["artifacts"]}
 
-        if not progressed:
-            time.sleep(0.2)
-    else:
-        with SessionLocal() as db:
-            cur = db.get(Job, job_id)
-            raise AssertionError(
-                "Pipeline did not reach DONE for all stages before timeout. "
-                f"Current statuses: "
-                f"script={cur.script_status}, audio={cur.audio_status}, "
-                f"visuals={cur.visuals_status}, render={cur.render_status}"
-            )
+        assert {"script_markdown", "audio_wav", "visuals_svg", "render_plan"}.issubset(kinds)
 
-    # Cleanup the job row (keeps dev DB tidy)
-    with SessionLocal() as db:
-        cur = db.get(Job, job_id)
-        if cur is not None:
-            db.delete(cur)
-            db.commit()
+        assert "script/script.md" in relpaths
+        assert "audio/audio.wav" in relpaths
+        assert "visuals/cover.svg" in relpaths
+        assert "render/render_plan.json" in relpaths
+
+        has_mp4 = "final_video" in kinds and "render/final.mp4" in relpaths
+        has_txt = "final_output_notice" in kinds and "render/final.txt" in relpaths
+        assert has_mp4 or has_txt
+    finally:
+        # Best-effort cleanup so repeated runs don't bloat the jobs table.
+        try:
+            with SessionLocal() as db:
+                j = db.get(Job, job_id)
+                if j is not None:
+                    db.delete(j)
+                    db.commit()
+        except Exception:
+            pass

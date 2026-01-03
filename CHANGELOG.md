@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, but kept intentionally lightweight for a fast-moving codebase.
 
+## Version 0.1.2 - 2026-01-03
+
+### Added
+- Deterministic placeholder stage outputs for local development:
+  - `audio/audio.wav` (short silent WAV) + `audio/audio_plan.json`
+  - `visuals/cover.svg` (simple SVG cover) + `visuals/visuals_plan.json`
+  - `render/render_plan.json` (documents whether `final.mp4` was produced or a fallback was written)
+- `sf clean-artifacts` command to delete the local `./artifacts/` directory
+- Smoke tests:
+  - Manifest test that runs stage work and asserts expected `manifest.json` entries
+  - End-to-end DB-backed smoke test that drives a job through all stages to `DONE`
+- CI workflow split:
+  - Fast CI runs lint/format + `pytest -m "not smoke"`
+  - Separate `Smoke (DB)` workflow (manual + scheduled) that runs migrations and `pytest -m smoke` against a Postgres service container
+
+### Changed
+- GitHub Actions CI no longer requires Postgres on every push/PR (smoke is run separately)
+- Pytest marker configuration updated to register the `smoke` mark
+
 ## Version 0.1.1 - 2026-01-03
 
 ### Added

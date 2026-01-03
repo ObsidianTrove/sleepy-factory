@@ -1,0 +1,47 @@
+name: Smoke (DB)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 8 * * *" # daily at 08:30 UTC (04:30 AM US Eastern during Summer, 03:30 AM during Winter)
+
+concurrency:
+  group: smoke-db
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dev
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: sleepy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U dev -d sleepy"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    env:
+      DATABASE_URL: postgresql+psycopg://dev:dev@localhost:5432/sleepy
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Sync
+        run: ~/.local/bin/uv sync --dev
+
+      - name: Run migrations
+        run: ~/.local/bin/uv run alembic upgrade head
+
+      - name: Pytest (smoke)
+        run: ~/.local/bin/uv run pytest -q -m smoke

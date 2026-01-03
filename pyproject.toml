@@ -38,3 +38,8 @@ ignore = ["E501"]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.pytest.ini_options]
+markers = [
+  "smoke: database-backed smoke tests (requires local Postgres + migrations)",
+]

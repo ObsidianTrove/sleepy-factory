@@ -2,14 +2,15 @@
 
 Sleepy Factory is a Python-first, Postgres-backed pipeline skeleton for building a reliable, distributed-friendly "content factory" workflow.
 
-It is intentionally built around boring, production-proven primitives:
+It is intentionally built around production-proven primitives:
 
 - A database-backed state machine (Postgres is the source of truth)
 - Concurrency-safe job claiming using `SELECT ... FOR UPDATE SKIP LOCKED`
 - Per-stage leases to safely recover work after crashes, sleeps, or restarts
-- A small CLI (`sf`) you can run locally today and evolve into a distributed system later
+- A small CLI (`sf`) that runs locally today and can evolve into a distributed system later
+- On-disk artifact tracking with a per-job `manifest.json`
 
-This repository is a foundation. The current implementation is a working pipeline simulator with real locking, real persistence, real recovery logic, and real on-disk artifacts. The next layers will add actual AI generation and media output.
+This repository is a foundation. The current implementation is a working pipeline simulator with real locking, real persistence, real recovery logic, and real on-disk artifacts. The next layers add real AI generation and media output.
 
 ---
 
@@ -21,11 +22,12 @@ The long-term goal is to automate end-to-end YouTube video generation (as much a
 - 15 to 20 minute long-form informational videos
 - Short-form content
 
-This repo currently focuses on the reliability core: a state machine + orchestrator + workers + leases + recovery + artifact tracking. It does not yet implement real AI generation for audio or visuals.
+This repo currently focuses on the reliability core: a state machine + orchestrator + workers + leases + recovery + artifact tracking.
+Audio and visuals are currently placeholder outputs, designed to be deterministic and dependency-light.
 
 ---
 
-## Current pipeline model
+## Pipeline model
 
 Stages (in order):
 
@@ -49,13 +51,25 @@ The orchestrator owns transitions between stages. Workers only claim and complet
 Each job writes outputs to the local `./artifacts/` directory:
 
 - `artifacts/<job_id>/manifest.json` is the single source of truth for produced files
-- each stage writes to `artifacts/<job_id>/<stage>/...`
+- each stage writes into `artifacts/<job_id>/<stage>/...`
 
 The `artifacts/` directory is intentionally git-ignored. It is generated output and can become very large (especially MP4s).
 
-Current outputs:
-- `script` writes `script.md` and `script.json`
-- `render` writes `final.mp4` if `ffmpeg` is installed, otherwise a small fallback file describing what is missing
+Current placeholder outputs:
+
+- `script`
+  - `script.md`
+  - `script.json`
+- `audio`
+  - `audio.wav` (short silent WAV, no external dependencies)
+  - `audio_plan.json`
+- `visuals`
+  - `cover.svg` (simple SVG cover, no external dependencies)
+  - `visuals_plan.json`
+- `render`
+  - always writes `render_plan.json`
+  - writes `final.mp4` if `ffmpeg` is available on PATH
+  - otherwise writes `final.txt` describing what is missing
 
 ---
 
@@ -65,11 +79,12 @@ Current outputs:
 - Concurrent worker claiming with `SKIP LOCKED` so multiple workers can run safely
 - Per-stage lease fields so stuck jobs can be reclaimed safely
 - Recovery loop that re-queues work whose lease has expired
-- Dev mode: run orchestrator + recovery + workers in a single terminal (`sf dev`)
+- Dev mode: run orchestrator + recovery + all workers in a single terminal (`sf dev`)
 - Tooling:
   - `uv` for environments + lockfile (`uv.lock`)
   - `ruff` for linting and formatting
-  - GitHub Actions CI to keep the repo clean
+  - `pytest` for tests (fast and DB-backed smoke tests)
+  - GitHub Actions workflows (fast CI plus scheduled DB smoke)
 
 ---
 
@@ -77,7 +92,7 @@ Current outputs:
 
 - Windows + PowerShell (instructions are written for this setup)
 - Python 3.14
-- Docker Desktop
+- Docker Desktop (for local Postgres)
 - `uv` installed
 - `ffmpeg` (optional, only needed to generate `final.mp4`)
 
@@ -97,25 +112,28 @@ See `LICENSE`.
 ## Step-by-step setup (Windows PowerShell)
 
 ### 1) Clone the repo
+
 ```powershell
 git clone https://github.com/ObsidianTrove/sleepy-factory.git
 cd sleepy-factory
 ```
 
 ### 2) Create your local `.env`
+
 This repo does not commit `.env`. Create it from the template:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-`.env.example` uses local Docker Compose Postgres:
+`.env.example` is configured for local Docker Compose Postgres:
 
 ```env
 DATABASE_URL=postgresql+psycopg://dev:dev@localhost:5432/sleepy
 ```
 
 ### 3) Start Postgres (Docker Compose)
+
 ```powershell
 docker compose up -d
 docker compose ps
@@ -124,7 +142,6 @@ docker compose ps
 You should see a `postgres` container running.
 
 ### 4) Install dependencies with uv
-Create a virtual environment and install dev dependencies:
 
 ```powershell
 uv venv
@@ -132,6 +149,7 @@ uv sync --dev
 ```
 
 ### 5) Apply database migrations
+
 ```powershell
 uv run alembic upgrade head
 ```
@@ -147,8 +165,10 @@ uv run alembic heads
 
 ## Running the pipeline
 
-### Recommended: Dev mode (one terminal)
-This runs:
+### Recommended: dev mode (one terminal)
+
+This runs in a single process using threads:
+
 - orchestrator loop
 - recovery loop
 - script worker
@@ -156,7 +176,7 @@ This runs:
 - visuals worker
 - render worker
 
-In one VS Code terminal:
+In a VS Code terminal:
 
 ```powershell
 uv run sf dev
@@ -165,6 +185,7 @@ uv run sf dev
 Stop it with `Ctrl+C`.
 
 ### Create jobs (in a second terminal)
+
 ```powershell
 uv run sf new-job
 uv run sf list-jobs
@@ -178,44 +199,50 @@ A completed job will show all stages as `DONE`.
 
 If you want `render/final.mp4` to be generated, install ffmpeg and ensure it is on your PATH.
 
-After installation, verify:
+Verify:
 
 ```powershell
 ffmpeg -version
 ```
 
-If ffmpeg is not installed, the render stage will still complete and will write a small fallback artifact in `artifacts/<job_id>/render/` describing what is missing.
+If ffmpeg is not installed, the render stage still completes and will write `final.txt` plus `render_plan.json` to explain what is missing.
 
 ---
 
 ## CLI commands
 
 Create a new job:
+
 ```powershell
 uv run sf new-job
 ```
 
 List recent jobs:
+
 ```powershell
 uv run sf list-jobs --limit 20
 ```
 
 Run the orchestrator once:
+
 ```powershell
 uv run sf orchestrator
 ```
 
 Run orchestrator loop:
+
 ```powershell
 uv run sf orchestrator-loop --poll 1.0
 ```
 
 Run recovery loop:
+
 ```powershell
 uv run sf recovery --poll 5.0
 ```
 
 Run a single stage worker:
+
 ```powershell
 uv run sf worker --stage script
 uv run sf worker --stage audio
@@ -224,8 +251,15 @@ uv run sf worker --stage render
 ```
 
 Run everything in one process (dev mode):
+
 ```powershell
 uv run sf dev
+```
+
+Delete all generated artifacts:
+
+```powershell
+uv run sf clean-artifacts
 ```
 
 ---
@@ -233,6 +267,7 @@ uv run sf dev
 ## How it works (technical overview)
 
 ### Orchestrator: transitions only
+
 The orchestrator advances jobs through the pipeline:
 
 - `script:  NEW -> READY`
@@ -240,10 +275,12 @@ The orchestrator advances jobs through the pipeline:
 - `visuals: NEW -> READY` only when `audio=DONE`
 - `render:  NEW -> READY` only when `visuals=DONE`
 
-Workers do not advance downstream stages. This makes stage transitions deterministic and centralized.
+Workers do not advance downstream stages. This keeps transitions deterministic and centralized.
 
 ### Workers: claim safely, then complete
+
 Each worker:
+
 1. Selects a `READY` job with `FOR UPDATE SKIP LOCKED`
 2. Sets stage `READY -> RUNNING`
 3. Writes lease fields (`<stage>_lease_owner`, `<stage>_lease_expires_at`)
@@ -253,12 +290,52 @@ Each worker:
 This prevents double-processing and supports horizontal scaling.
 
 ### Recovery: self-healing
-If a machine crashes or sleeps during `RUNNING`, the job can be stuck.
+
+If a process crashes or a machine sleeps during `RUNNING`, work can get stuck.
 
 The recovery loop:
+
 - finds `RUNNING` stages with expired leases
 - re-queues them back to `READY`
 - clears the lease fields
+
+---
+
+## Tests and CI
+
+This repo has two types of tests:
+
+- Fast tests (no database), run on every push and PR
+- Smoke tests (require Postgres), run via a separate GitHub Actions workflow
+
+### Run tests locally
+
+Fast tests:
+
+```powershell
+uv run pytest -q
+```
+
+Smoke tests (requires Docker Postgres and migrations):
+
+```powershell
+docker compose up -d
+uv run alembic upgrade head
+uv run pytest -q -m smoke
+```
+
+### GitHub Actions workflows
+
+- `CI` runs:
+  - Ruff lint + format checks
+  - `pytest -m "not smoke"`
+
+- `Smoke (DB)` runs:
+  - Postgres service container
+  - migrations (`alembic upgrade head`)
+  - `pytest -m smoke`
+
+  It is triggered manually (`workflow_dispatch`) and also runs on a daily schedule.
 
 ---
 
@@ -274,42 +351,14 @@ sleepy_factory/
     session.py           # DB engine/session
     migrations/          # Alembic env + versions
 .github/
-  workflows/ci.yml        # Ruff + pytest checks via uv
-docker-compose.yml        # local Postgres
-pyproject.toml            # dependencies + tooling config
-uv.lock                   # reproducible dependency lockfile
-.env.example              # environment template
-tests/                    # minimal test scaffolding (CI sanity)
-```
-
----
-
-## Development workflow
-
-### Lint and format
-```powershell
-uv run ruff check . --fix
-uv run ruff format .
-```
-
-### CI-style checks
-```powershell
-uv run ruff check .
-uv run ruff format --check .
-uv run pytest -q
-```
-
-### Creating migrations
-Autogenerate a migration after changing models:
-
-```powershell
-uv run alembic revision --autogenerate -m "describe change"
-```
-
-Apply migrations:
-
-```powershell
-uv run alembic upgrade head
+  workflows/
+    ci.yml               # Ruff + fast pytest (excludes smoke)
+    smoke.yml            # Postgres + migrations + smoke tests (scheduled/manual)
+docker-compose.yml       # local Postgres
+pyproject.toml           # dependencies + tooling config
+uv.lock                  # reproducible dependency lockfile
+.env.example             # environment template
+tests/                   # pytest tests (fast + smoke)
 ```
 
 ---
@@ -319,7 +368,7 @@ uv run alembic upgrade head
 This repo is deliberately building from the bottom up:
 
 1. Reliability primitives (current)
-2. Artifact storage + stage outputs (in progress)
+2. Artifact storage + stage outputs (current, placeholder implementations)
 3. Observability (structured logs, metrics)
 4. Stage implementations:
    - prompt and script generation

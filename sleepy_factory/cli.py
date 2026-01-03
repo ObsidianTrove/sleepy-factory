@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
 import threading
+import wave
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Final
 
 from rich import print
@@ -39,7 +43,6 @@ def orchestrator_tick(db: Session) -> int:
     """
     moved = 0
 
-    # script: NEW -> READY
     jobs = list(
         db.execute(select(Job).where(Job.script_status == StageStatus.NEW).limit(50)).scalars()
     )
@@ -47,7 +50,6 @@ def orchestrator_tick(db: Session) -> int:
         job.script_status = StageStatus.READY
         moved += 1
 
-    # audio: gate on script DONE
     jobs = list(
         db.execute(
             select(Job)
@@ -59,7 +61,6 @@ def orchestrator_tick(db: Session) -> int:
         job.audio_status = StageStatus.READY
         moved += 1
 
-    # visuals: gate on audio DONE
     jobs = list(
         db.execute(
             select(Job)
@@ -71,7 +72,6 @@ def orchestrator_tick(db: Session) -> int:
         job.visuals_status = StageStatus.READY
         moved += 1
 
-    # render: gate on visuals DONE
     jobs = list(
         db.execute(
             select(Job)
@@ -117,10 +117,25 @@ def claim_one_job_for_stage(db: Session, stage: str, lease_minutes: int = 10) ->
     return job
 
 
+def _ffmpeg() -> str | None:
+    return shutil.which("ffmpeg")
+
+
+def _run_ffmpeg(cmd: list[str]) -> None:
+    # Capture output to make failures actionable.
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        msg = "ffmpeg failed"
+        if stderr:
+            msg += f"\n\nstderr:\n{stderr}"
+        if stdout:
+            msg += f"\n\nstdout:\n{stdout}"
+        raise RuntimeError(msg)
+
+
 def run_stage_work(job_id: str, stage: str) -> None:
-    """
-    Stage work writes artifacts into artifacts/<job_id>/<stage>/ and records them into manifest.json.
-    """
     if stage == "script":
         script_md = (
             "# Video Script\n\n"
@@ -145,8 +160,65 @@ def run_stage_work(job_id: str, stage: str) -> None:
         write_json(job_id, "script", "script.json", script_obj, kind="script_structured")
         return
 
+    if stage == "audio":
+        # Minimal deterministic artifact: a short silent WAV (no external deps).
+        sample_rate = 48_000
+        seconds = 2
+        nchannels = 2
+        sampwidth = 2  # 16-bit PCM
+        nframes = sample_rate * seconds
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(nchannels)
+            wf.setsampwidth(sampwidth)
+            wf.setframerate(sample_rate)
+
+            silence_sample = struct.pack("<h", 0)  # int16
+            silence_frame = silence_sample * nchannels
+            wf.writeframes(silence_frame * nframes)
+
+        write_bytes(job_id, "audio", "audio.wav", buf.getvalue(), kind="audio_wav")
+        write_json(
+            job_id,
+            "audio",
+            "audio_plan.json",
+            {
+                "status": "placeholder",
+                "format": "wav",
+                "sample_rate": sample_rate,
+                "channels": nchannels,
+                "seconds": seconds,
+                "output": "audio.wav",
+            },
+            kind="audio_plan",
+        )
+        return
+
+    if stage == "visuals":
+        # Minimal deterministic artifact: an SVG "cover" (no external deps).
+        now = datetime.now(UTC).isoformat()
+        svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+  <rect width="1280" height="720" fill="#111"/>
+  <text x="64" y="140" fill="#fff" font-size="64" font-family="Arial, Helvetica, sans-serif">Sleepy Factory</text>
+  <text x="64" y="230" fill="#bbb" font-size="32" font-family="Arial, Helvetica, sans-serif">Job: {job_id}</text>
+  <text x="64" y="290" fill="#777" font-size="24" font-family="Arial, Helvetica, sans-serif">Generated: {now}</text>
+  <text x="64" y="360" fill="#888" font-size="28" font-family="Arial, Helvetica, sans-serif">Placeholder visuals (SVG)</text>
+</svg>
+"""
+        write_text(job_id, "visuals", "cover.svg", svg, kind="visuals_svg")
+        write_json(
+            job_id,
+            "visuals",
+            "visuals_plan.json",
+            {"status": "placeholder", "format": "svg", "cover": "cover.svg"},
+            kind="visuals_plan",
+        )
+        return
+
     if stage == "render":
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = _ffmpeg()
         if not ffmpeg:
             write_text(
                 job_id,
@@ -164,10 +236,12 @@ def run_stage_work(job_id: str, stage: str) -> None:
             )
             return
 
-        # Create video into a temp file, then record it through write_bytes (to get manifest + checksum).
-        with tempfile.TemporaryDirectory() as td:
-            tmp_out = os.path.join(td, "final.mp4")
+        # Best practice: render to a true temp path, then persist into artifacts via write_bytes().
+        tmp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        tmp_path = Path(tmp_file.name)
+        tmp_file.close()  # ffmpeg needs exclusive access on Windows
 
+        try:
             cmd = [
                 ffmpeg,
                 "-y",
@@ -186,22 +260,25 @@ def run_stage_work(job_id: str, stage: str) -> None:
                 "yuv420p",
                 "-c:a",
                 "aac",
-                tmp_out,
+                str(tmp_path),
             ]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            _run_ffmpeg(cmd)
 
-            data = open(tmp_out, "rb").read()
+            data = tmp_path.read_bytes()
             write_bytes(job_id, "render", "final.mp4", data, kind="final_video")
             write_json(
                 job_id,
                 "render",
                 "render_plan.json",
-                {"status": "ok", "output": "final.mp4", "duration_seconds": 6},
+                {"status": "placeholder", "output": "final.mp4"},
                 kind="render_plan",
             )
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
         return
 
-    # audio + visuals are simulated for now (no outputs)
+    # Unknown stage (should not happen with STAGES choices)
     return
 
 
@@ -236,9 +313,7 @@ def complete_job_stage(
     return True
 
 
-def run_worker_loop(
-    stage: str, poll_seconds: float = 1.0, stop_event: threading.Event | None = None
-):
+def run_worker_loop(stage: str, poll_seconds: float = 1.0, stop_event: threading.Event | None = None):
     if stop_event is None:
         stop_event = threading.Event()
 
@@ -254,7 +329,6 @@ def run_worker_loop(
 
         print(f"[{stage}] Claimed job {job.id} (attempt {job.attempts})")
 
-        # Work happens outside DB transaction.
         try:
             run_stage_work(str(job.id), stage)
             success = True
@@ -264,9 +338,7 @@ def run_worker_loop(
             err = f"{type(exc).__name__}: {exc}"
 
         with SessionLocal() as db:
-            ok = complete_job_stage(
-                db, job.id, owner=owner, stage=stage, success=success, error=err
-            )
+            ok = complete_job_stage(db, job.id, owner=owner, stage=stage, success=success, error=err)
             print(f"[{stage}] Completed job {job.id}: {ok} (success={success})")
 
 
