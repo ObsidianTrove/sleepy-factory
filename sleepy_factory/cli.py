@@ -8,10 +8,12 @@ import struct
 import subprocess
 import tempfile
 import threading
+import uuid
 import wave
+from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from rich import print
 from sqlalchemy import and_, or_, select
@@ -19,7 +21,9 @@ from sqlalchemy.orm import Session
 
 from sleepy_factory.artifacts import (
     ARTIFACTS_ROOT,
+    job_dir,
     load_job_spec,
+    load_manifest,
     write_bytes,
     write_job_spec,
     write_json,
@@ -98,9 +102,20 @@ def orchestrator_tick(db: Session) -> int:
     return moved
 
 
-def claim_one_job_for_stage(db: Session, stage: str, lease_minutes: int = 10) -> Job | None:
+def claim_one_job_for_stage(
+    db: Session,
+    stage: str,
+    owner: str,
+    lease_minutes: int = 10,
+) -> Job | None:
+    """
+    Claim a single READY job for `stage` using SKIP LOCKED.
+
+    Best practice:
+    - Only mutate stage fields and lease fields here.
+    - Do NOT increment job-level counters here (attempts is per job run, not per stage claim).
+    """
     now = datetime.now(UTC)
-    owner = f"{socket.gethostname()}:{os.getpid()}:{stage}"
 
     status_field, lease_owner_field, lease_expires_field = stage_fields(stage)
     status_col = getattr(Job, status_field)
@@ -120,7 +135,6 @@ def claim_one_job_for_stage(db: Session, stage: str, lease_minutes: int = 10) ->
     setattr(job, lease_owner_field, owner)
     setattr(job, lease_expires_field, Job.new_lease_expiry(now, minutes=lease_minutes))
 
-    job.attempts += 1
     job.last_error = None
 
     db.commit()
@@ -145,7 +159,7 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         raise RuntimeError(msg)
 
 
-def _load_spec(job_id: str) -> dict:
+def _load_spec(job_id: str) -> dict[str, Any]:
     """
     Best-effort load of per-job spec. If missing, return stable defaults.
     This keeps run_stage_work() usable from tests or ad-hoc runs.
@@ -161,8 +175,7 @@ def _load_spec(job_id: str) -> dict:
 
     voice = str(spec.get("voice", "calm")).strip() or "calm"
 
-    # Keep created_at stable if absent. Avoid injecting timestamps into artifacts.
-    created_at = str(spec.get("created_at", ""))
+    created_at = str(spec.get("created_at", "")).strip()
     if not created_at:
         created_at = "unknown"
 
@@ -236,7 +249,6 @@ def run_stage_work(job_id: str, stage: str) -> None:
         return
 
     if stage == "audio":
-        # Produce a short, deterministic silent WAV, regardless of requested length.
         produced_seconds = max(1, min(requested_length_seconds, MAX_PLACEHOLDER_AUDIO_SECONDS))
         sample_rate = 48_000
         nchannels = 2
@@ -275,7 +287,6 @@ def run_stage_work(job_id: str, stage: str) -> None:
         return
 
     if stage == "visuals":
-        # Deterministic SVG cover that reflects the spec (no runtime timestamp).
         svg = f"""<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
   <rect width="1280" height="720" fill="#111"/>
@@ -333,7 +344,7 @@ def run_stage_work(job_id: str, stage: str) -> None:
 
         tmp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         tmp_path = Path(tmp_file.name)
-        tmp_file.close()  # ffmpeg needs exclusive access on Windows
+        tmp_file.close()
 
         try:
             cmd = [
@@ -415,7 +426,7 @@ def complete_job_stage(
 
 def run_worker_loop(
     stage: str, poll_seconds: float = 1.0, stop_event: threading.Event | None = None
-):
+) -> None:
     if stop_event is None:
         stop_event = threading.Event()
 
@@ -424,12 +435,12 @@ def run_worker_loop(
 
     while not stop_event.is_set():
         with SessionLocal() as db:
-            job = claim_one_job_for_stage(db, stage=stage)
+            job = claim_one_job_for_stage(db, stage=stage, owner=owner)
             if not job:
                 stop_event.wait(poll_seconds)
                 continue
 
-        print(f"[{stage}] Claimed job {job.id} (attempt {job.attempts})")
+        print(f"[{stage}] Claimed job {job.id} (job_runs={job.attempts})")
 
         try:
             run_stage_work(str(job.id), stage)
@@ -446,7 +457,9 @@ def run_worker_loop(
             print(f"[{stage}] Completed job {job.id}: {ok} (success={success})")
 
 
-def run_orchestrator_loop(poll_seconds: float = 1.0, stop_event: threading.Event | None = None):
+def run_orchestrator_loop(
+    poll_seconds: float = 1.0, stop_event: threading.Event | None = None
+) -> None:
     if stop_event is None:
         stop_event = threading.Event()
 
@@ -497,7 +510,7 @@ def recover_expired_leases(db: Session, limit: int = 50) -> int:
     return recovered
 
 
-def run_recovery_loop(poll_seconds: float = 5.0, stop_event: threading.Event | None = None):
+def run_recovery_loop(poll_seconds: float = 5.0, stop_event: threading.Event | None = None) -> None:
     if stop_event is None:
         stop_event = threading.Event()
 
@@ -513,6 +526,7 @@ def run_recovery_loop(poll_seconds: float = 5.0, stop_event: threading.Event | N
 def create_new_job(topic: str, video_format: str, length_seconds: int, voice: str) -> None:
     with SessionLocal() as db:
         job = Job()
+        job.attempts = 1  # attempts == job runs (per job), not per stage claim
         db.add(job)
         db.commit()
         db.refresh(job)
@@ -546,8 +560,72 @@ def list_jobs(limit: int = 20) -> None:
             f"audio={j.audio_status}({j.audio_lease_owner})  "
             f"visuals={j.visuals_status}({j.visuals_lease_owner})  "
             f"render={j.render_status}({j.render_lease_owner})  "
-            f"attempts={j.attempts}"
+            f"job_runs={j.attempts}"
         )
+
+
+def show_job(job_id: str) -> None:
+    try:
+        job_uuid = uuid.UUID(job_id)
+    except ValueError:
+        print(f"[red]Invalid job id (expected UUID):[/red] {job_id}")
+        return
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_uuid)
+
+    if job is None:
+        print(f"[red]Job not found in DB:[/red] {job_id}")
+    else:
+        print(f"[bold]Job[/bold] {job.id}")
+        print(f"  job_runs={job.attempts}")
+        print(f"  last_error={job.last_error!r}")
+        print(f"  created_at={job.created_at}")
+        print(f"  updated_at={job.updated_at}")
+
+        for stage in STAGES:
+            status_field, lease_owner_field, lease_expires_field = stage_fields(stage)
+            status = getattr(job, status_field)
+            owner = getattr(job, lease_owner_field)
+            exp = getattr(job, lease_expires_field)
+            print(f"  {stage}: {status}  lease_owner={owner!r}  lease_expires_at={exp}")
+
+    print()
+    print(f"[bold]Artifacts root[/bold] {ARTIFACTS_ROOT}")
+
+    spec = load_job_spec(job_id)
+    if spec is None:
+        print("[yellow]No job spec found[/yellow] (job.json)")
+    else:
+        print("[bold]Job spec[/bold] (job.json)")
+        for k in ("topic", "format", "length_seconds", "voice", "created_at"):
+            if k in spec:
+                print(f"  {k}: {spec.get(k)}")
+
+    manifest_path = job_dir(job_id) / "manifest.json"
+    if not manifest_path.exists():
+        print()
+        print("[yellow]No manifest found[/yellow] (manifest.json)")
+        return
+
+    manifest = load_manifest(job_id)
+    artifacts_list = manifest.get("artifacts", [])
+    print()
+    print(f"[bold]Manifest[/bold] artifacts={len(artifacts_list)}  path={manifest_path}")
+
+    by_stage: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for a in artifacts_list:
+        stage = str(a.get("stage", "unknown"))
+        by_stage[stage].append(a)
+
+    for stage in sorted(by_stage.keys()):
+        print()
+        print(f"[bold]{stage}[/bold]")
+        for a in by_stage[stage]:
+            kind = a.get("kind")
+            relpath = a.get("relpath")
+            nbytes = a.get("bytes")
+            print(f"  - {kind}  {relpath}  ({nbytes} bytes)")
 
 
 def clean_artifacts() -> None:
@@ -631,6 +709,9 @@ def main() -> None:
 
     sub.add_parser("clean-artifacts")
 
+    p_show = sub.add_parser("show-job")
+    p_show.add_argument("job_id", type=str)
+
     args = parser.parse_args()
 
     if args.cmd == "dev":
@@ -670,4 +751,8 @@ def main() -> None:
 
     if args.cmd == "clean-artifacts":
         clean_artifacts()
+        return
+
+    if args.cmd == "show-job":
+        show_job(args.job_id)
         return
