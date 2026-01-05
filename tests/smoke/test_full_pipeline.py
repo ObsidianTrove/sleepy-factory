@@ -36,6 +36,19 @@ def test_full_pipeline_reaches_done_and_writes_artifacts(
         job_id = job.id
 
     try:
+        # Write a deterministic job spec so stage outputs are realistic and stable.
+        artifacts.write_job_spec(
+            str(job_id),
+            {
+                "job_id": str(job_id),
+                "topic": "smoke test topic",
+                "format": "short",
+                "length_seconds": 60,
+                "voice": "calm",
+                "created_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
         # Move script NEW -> READY (and possibly other jobs too, but we only act on ours below).
         with SessionLocal() as db:
             orchestrator_tick(db)
@@ -51,11 +64,18 @@ def test_full_pipeline_reaches_done_and_writes_artifacts(
                 j = db.get(Job, job_id)
                 assert j is not None
 
-                if getattr(j, status_field) == StageStatus.NEW:
+                st = getattr(j, status_field)
+                assert st in (
+                    StageStatus.NEW,
+                    StageStatus.READY,
+                ), f"{stage} unexpected status before claim: {st}"
+
+                if st == StageStatus.NEW:
                     orchestrator_tick(db)
                     db.refresh(j)
+                    st = getattr(j, status_field)
 
-                assert getattr(j, status_field) == StageStatus.READY
+                assert st == StageStatus.READY, f"{stage} expected READY, got {st}"
 
                 # "Claim" only this job (avoid claiming other READY jobs).
                 setattr(j, status_field, StageStatus.RUNNING)
@@ -81,9 +101,13 @@ def test_full_pipeline_reaches_done_and_writes_artifacts(
             assert j.audio_status == StageStatus.DONE
             assert j.visuals_status == StageStatus.DONE
             assert j.render_status == StageStatus.DONE
+            assert j.attempts == 4
 
         # Artifacts assertions
         manifest = artifacts.load_manifest(str(job_id))
+        assert manifest["job_id"] == str(job_id)
+        assert isinstance(manifest["artifacts"], list)
+
         kinds = {a["kind"] for a in manifest["artifacts"]}
         relpaths = {_norm(a["relpath"]) for a in manifest["artifacts"]}
 
@@ -94,6 +118,13 @@ def test_full_pipeline_reaches_done_and_writes_artifacts(
         assert "visuals/cover.svg" in relpaths
         assert "render/render_plan.json" in relpaths
 
+        # Optional sanity: script should reflect spec topic.
+        script_path = artifacts.job_dir(str(job_id)) / "script" / "script.md"
+        if script_path.exists():
+            txt = script_path.read_text(encoding="utf-8")
+            assert "smoke test topic" in txt
+
+        # Render output: ffmpeg optional, so accept either mp4 or fallback txt.
         has_mp4 = "final_video" in kinds and "render/final.mp4" in relpaths
         has_txt = "final_output_notice" in kinds and "render/final.txt" in relpaths
         assert has_mp4 or has_txt

@@ -17,11 +17,22 @@ from rich import print
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
-from sleepy_factory.artifacts import ARTIFACTS_ROOT, write_bytes, write_json, write_text
+from sleepy_factory.artifacts import (
+    ARTIFACTS_ROOT,
+    load_job_spec,
+    write_bytes,
+    write_job_spec,
+    write_json,
+    write_text,
+)
 from sleepy_factory.db.models import Job, StageStatus
 from sleepy_factory.db.session import SessionLocal
 
 STAGES: Final[list[str]] = ["script", "audio", "visuals", "render"]
+
+# Keep placeholder outputs small even if the spec requests long durations.
+MAX_PLACEHOLDER_AUDIO_SECONDS: Final[int] = 5
+MAX_PLACEHOLDER_RENDER_SECONDS: Final[int] = 6
 
 
 def stage_fields(stage: str) -> tuple[str, str, str]:
@@ -122,7 +133,6 @@ def _ffmpeg() -> str | None:
 
 
 def _run_ffmpeg(cmd: list[str]) -> None:
-    # Capture output to make failures actionable.
     proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
@@ -135,38 +145,103 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         raise RuntimeError(msg)
 
 
+def _load_spec(job_id: str) -> dict:
+    """
+    Best-effort load of per-job spec. If missing, return stable defaults.
+    This keeps run_stage_work() usable from tests or ad-hoc runs.
+    """
+    spec = load_job_spec(job_id) or {}
+    topic = str(spec.get("topic", "Untitled")).strip() or "Untitled"
+    video_format = str(spec.get("format", "short")).strip() or "short"
+
+    try:
+        length_seconds = int(spec.get("length_seconds", 60))
+    except Exception:
+        length_seconds = 60
+
+    voice = str(spec.get("voice", "calm")).strip() or "calm"
+
+    # Keep created_at stable if absent. Avoid injecting timestamps into artifacts.
+    created_at = str(spec.get("created_at", ""))
+    if not created_at:
+        created_at = "unknown"
+
+    return {
+        "topic": topic,
+        "format": video_format,
+        "length_seconds": length_seconds,
+        "voice": voice,
+        "created_at": created_at,
+    }
+
+
 def run_stage_work(job_id: str, stage: str) -> None:
+    spec = _load_spec(job_id)
+    topic = spec["topic"]
+    video_format = spec["format"]
+    requested_length_seconds = spec["length_seconds"]
+    voice = spec["voice"]
+    created_at = spec["created_at"]
+
     if stage == "script":
         script_md = (
-            "# Video Script\n\n"
+            f"# Video Script: {topic}\n\n"
+            "## Metadata\n"
+            f"- Format: {video_format}\n"
+            f"- Target length: {requested_length_seconds} seconds\n"
+            f"- Voice: {voice}\n"
+            f"- Spec created_at: {created_at}\n\n"
             "## Hook\n"
-            "Write a short hook here.\n\n"
+            f"Today we're talking about: **{topic}**.\n\n"
             "## Main Points\n"
-            "1. Point one\n"
-            "2. Point two\n"
-            "3. Point three\n\n"
+            "1. Key point one\n"
+            "2. Key point two\n"
+            "3. Key point three\n\n"
             "## Outro\n"
-            "Closing wrap-up.\n"
+            "Thanks for watching.\n"
         )
+
         script_obj = {
             "version": "0.1",
+            "topic": topic,
+            "format": video_format,
+            "length_seconds": requested_length_seconds,
+            "voice": voice,
             "sections": [
-                {"name": "hook", "text": "Write a short hook here."},
-                {"name": "main_points", "bullets": ["Point one", "Point two", "Point three"]},
-                {"name": "outro", "text": "Closing wrap-up."},
+                {"name": "hook", "text": f"Today we're talking about: {topic}."},
+                {
+                    "name": "main_points",
+                    "bullets": ["Key point one", "Key point two", "Key point three"],
+                },
+                {"name": "outro", "text": "Thanks for watching."},
             ],
         }
+
         write_text(job_id, "script", "script.md", script_md, kind="script_markdown")
         write_json(job_id, "script", "script.json", script_obj, kind="script_structured")
+        write_json(
+            job_id,
+            "script",
+            "script_plan.json",
+            {
+                "status": "placeholder",
+                "topic": topic,
+                "format": video_format,
+                "length_seconds": requested_length_seconds,
+                "voice": voice,
+                "outputs": ["script.md", "script.json"],
+            },
+            kind="script_plan",
+        )
         return
 
     if stage == "audio":
-        # Minimal deterministic artifact: a short silent WAV (no external deps).
+        # Produce a short, deterministic silent WAV, regardless of requested length.
+        produced_seconds = max(1, min(requested_length_seconds, MAX_PLACEHOLDER_AUDIO_SECONDS))
         sample_rate = 48_000
-        seconds = 2
         nchannels = 2
         sampwidth = 2  # 16-bit PCM
-        nframes = sample_rate * seconds
+        nframes = sample_rate * produced_seconds
 
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
@@ -185,10 +260,14 @@ def run_stage_work(job_id: str, stage: str) -> None:
             "audio_plan.json",
             {
                 "status": "placeholder",
-                "format": "wav",
+                "topic": topic,
+                "format": video_format,
+                "voice": voice,
+                "requested_length_seconds": requested_length_seconds,
+                "produced_length_seconds": produced_seconds,
+                "format_out": "wav",
                 "sample_rate": sample_rate,
                 "channels": nchannels,
-                "seconds": seconds,
                 "output": "audio.wav",
             },
             kind="audio_plan",
@@ -196,15 +275,15 @@ def run_stage_work(job_id: str, stage: str) -> None:
         return
 
     if stage == "visuals":
-        # Minimal deterministic artifact: an SVG "cover" (no external deps).
-        now = datetime.now(UTC).isoformat()
+        # Deterministic SVG cover that reflects the spec (no runtime timestamp).
         svg = f"""<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
   <rect width="1280" height="720" fill="#111"/>
-  <text x="64" y="140" fill="#fff" font-size="64" font-family="Arial, Helvetica, sans-serif">Sleepy Factory</text>
-  <text x="64" y="230" fill="#bbb" font-size="32" font-family="Arial, Helvetica, sans-serif">Job: {job_id}</text>
-  <text x="64" y="290" fill="#777" font-size="24" font-family="Arial, Helvetica, sans-serif">Generated: {now}</text>
-  <text x="64" y="360" fill="#888" font-size="28" font-family="Arial, Helvetica, sans-serif">Placeholder visuals (SVG)</text>
+  <text x="64" y="120" fill="#fff" font-size="64" font-family="Arial, Helvetica, sans-serif">Sleepy Factory</text>
+  <text x="64" y="200" fill="#bbb" font-size="34" font-family="Arial, Helvetica, sans-serif">Topic: {topic}</text>
+  <text x="64" y="250" fill="#aaa" font-size="28" font-family="Arial, Helvetica, sans-serif">Format: {video_format}</text>
+  <text x="64" y="300" fill="#888" font-size="24" font-family="Arial, Helvetica, sans-serif">Target: {requested_length_seconds}s</text>
+  <text x="64" y="350" fill="#666" font-size="20" font-family="Arial, Helvetica, sans-serif">Job: {job_id}</text>
 </svg>
 """
         write_text(job_id, "visuals", "cover.svg", svg, kind="visuals_svg")
@@ -212,13 +291,21 @@ def run_stage_work(job_id: str, stage: str) -> None:
             job_id,
             "visuals",
             "visuals_plan.json",
-            {"status": "placeholder", "format": "svg", "cover": "cover.svg"},
+            {
+                "status": "placeholder",
+                "topic": topic,
+                "format": video_format,
+                "requested_length_seconds": requested_length_seconds,
+                "cover": "cover.svg",
+            },
             kind="visuals_plan",
         )
         return
 
     if stage == "render":
         ffmpeg = _ffmpeg()
+        produced_seconds = max(1, min(requested_length_seconds, MAX_PLACEHOLDER_RENDER_SECONDS))
+
         if not ffmpeg:
             write_text(
                 job_id,
@@ -231,12 +318,19 @@ def run_stage_work(job_id: str, stage: str) -> None:
                 job_id,
                 "render",
                 "render_plan.json",
-                {"status": "needs_ffmpeg", "output": "final.mp4", "placeholder": "final.txt"},
+                {
+                    "status": "needs_ffmpeg",
+                    "topic": topic,
+                    "format": video_format,
+                    "requested_length_seconds": requested_length_seconds,
+                    "produced_length_seconds": produced_seconds,
+                    "output": "final.mp4",
+                    "placeholder": "final.txt",
+                },
                 kind="render_plan",
             )
             return
 
-        # Best practice: render to a true temp path, then persist into artifacts via write_bytes().
         tmp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         tmp_path = Path(tmp_file.name)
         tmp_file.close()  # ffmpeg needs exclusive access on Windows
@@ -248,7 +342,7 @@ def run_stage_work(job_id: str, stage: str) -> None:
                 "-f",
                 "lavfi",
                 "-i",
-                "color=c=black:s=1280x720:d=6",
+                f"color=c=black:s=1280x720:d={produced_seconds}",
                 "-f",
                 "lavfi",
                 "-i",
@@ -270,7 +364,14 @@ def run_stage_work(job_id: str, stage: str) -> None:
                 job_id,
                 "render",
                 "render_plan.json",
-                {"status": "placeholder", "output": "final.mp4"},
+                {
+                    "status": "placeholder",
+                    "topic": topic,
+                    "format": video_format,
+                    "requested_length_seconds": requested_length_seconds,
+                    "produced_length_seconds": produced_seconds,
+                    "output": "final.mp4",
+                },
                 kind="render_plan",
             )
         finally:
@@ -278,7 +379,6 @@ def run_stage_work(job_id: str, stage: str) -> None:
 
         return
 
-    # Unknown stage (should not happen with STAGES choices)
     return
 
 
@@ -410,20 +510,31 @@ def run_recovery_loop(poll_seconds: float = 5.0, stop_event: threading.Event | N
         stop_event.wait(poll_seconds)
 
 
-def create_new_job():
+def create_new_job(topic: str, video_format: str, length_seconds: int, voice: str) -> None:
     with SessionLocal() as db:
         job = Job()
         db.add(job)
         db.commit()
         db.refresh(job)
-        print(
-            "Created job "
-            f"{job.id} (script={job.script_status}, audio={job.audio_status}, visuals={job.visuals_status}, "
-            f"render={job.render_status})"
-        )
+
+    spec = {
+        "job_id": str(job.id),
+        "topic": topic,
+        "format": video_format,
+        "length_seconds": int(length_seconds),
+        "voice": voice,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    write_job_spec(str(job.id), spec)
+
+    print(
+        "Created job "
+        f"{job.id} (script={job.script_status}, audio={job.audio_status}, visuals={job.visuals_status}, "
+        f"render={job.render_status})"
+    )
 
 
-def list_jobs(limit: int = 20):
+def list_jobs(limit: int = 20) -> None:
     with SessionLocal() as db:
         q = select(Job).order_by(Job.created_at.desc()).limit(limit)
         jobs = list(db.execute(q).scalars())
@@ -448,7 +559,7 @@ def clean_artifacts() -> None:
     print(f"[green]Deleted artifacts directory:[/green] {ARTIFACTS_ROOT}")
 
 
-def run_dev(orchestrator_poll: float = 1.0, recovery_poll: float = 5.0):
+def run_dev(orchestrator_poll: float = 1.0, recovery_poll: float = 5.0) -> None:
     stop_event = threading.Event()
 
     threads: list[threading.Thread] = [
@@ -488,13 +599,17 @@ def run_dev(orchestrator_poll: float = 1.0, recovery_poll: float = 5.0):
         print("[bold]Stopped.[/bold]")
 
 
-def main():
+def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(prog="sf")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("new-job")
+    p_new = sub.add_parser("new-job")
+    p_new.add_argument("--topic", type=str, default="sleepy factory demo")
+    p_new.add_argument("--format", type=str, default="short", choices=["short", "long", "sleepy"])
+    p_new.add_argument("--length-seconds", type=int, default=60)
+    p_new.add_argument("--voice", type=str, default="calm")
 
     p_list = sub.add_parser("list-jobs")
     p_list.add_argument("--limit", type=int, default=20)
@@ -531,7 +646,12 @@ def main():
         return
 
     if args.cmd == "new-job":
-        create_new_job()
+        create_new_job(
+            topic=args.topic,
+            video_format=args.format,
+            length_seconds=args.length_seconds,
+            voice=args.voice,
+        )
         return
 
     if args.cmd == "list-jobs":

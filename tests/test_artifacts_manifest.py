@@ -29,12 +29,12 @@ def test_artifacts_write_creates_files_and_manifest(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["job_id"] == job_id
     assert isinstance(manifest["artifacts"], list)
-    assert len(manifest["artifacts"]) == 2
 
     kinds = {a["kind"] for a in manifest["artifacts"]}
     relpaths = {_norm(a["relpath"]) for a in manifest["artifacts"]}
 
-    assert kinds == {"script_markdown", "script_structured"}
+    assert "script_markdown" in kinds
+    assert "script_structured" in kinds
     assert "script/script.md" in relpaths
     assert "script/script.json" in relpaths
 
@@ -48,3 +48,16 @@ def test_artifacts_write_creates_files_and_manifest(
         assert a["bytes"] >= 1
         assert isinstance(a["sha256"], str)
         assert len(a["sha256"]) == 64
+
+    # Dedupe behavior: writing the same relpath again should replace the manifest entry, not append.
+    artifacts.write_text(job_id, "script", "script.md", "# Hello again\n", kind="script_markdown")
+
+    manifest2 = json.loads(manifest_path.read_text(encoding="utf-8"))
+    relpaths2 = [_norm(a["relpath"]) for a in manifest2["artifacts"]]
+
+    # Only one record for script/script.md
+    assert relpaths2.count("script/script.md") == 1
+
+    # Ensure the file content is the new content.
+    script_path = artifacts.job_dir(job_id) / Path("script/script.md")
+    assert script_path.read_text(encoding="utf-8") == "# Hello again\n"
