@@ -22,8 +22,32 @@ The long-term goal is to automate end-to-end YouTube video generation (as much a
 - 15 to 20 minute long-form informational videos
 - Short-form content
 
-This repo currently focuses on the reliability core: a state machine + orchestrator + workers + leases + recovery + artifact tracking.
-Audio and visuals are currently placeholder outputs, designed to be deterministic and dependency-light.
+This repo currently focuses on the reliability core: a state machine + orchestrator + workers + leases + recovery + artifact tracking. Audio and visuals are currently placeholder outputs, designed to be deterministic and dependency-light.
+
+---
+
+## AI Evaluation & Reliability Architecture
+
+Unlike standard "generative scripts," Sleepy Factory is architected as a self-correcting manufacturing pipeline. It focuses on observability, deterministic evaluation, and failure recovery.
+
+### 1. The "QA Contract" pattern
+
+Every generation stage (Script, TTS, Render) must produce two things:
+
+- **The artifact:** the actual content (JSON, MP3, MP4).
+- **The QA report:** a structured evaluation of quality (for example `script_score`, `audio_clipping_detected`, `render_sync_drift`).
+
+**Outcome:** the system autonomously rejects low-quality generations before incurring the cost of the next stage.
+
+### 2. Distributed control plane
+
+- **State management:** Postgres-backed state machine using `SELECT ... FOR UPDATE SKIP LOCKED`.
+- **Crash safety:** lease-based locking ensures that if a worker node dies (OOM or network), the recovery loop reclaims and re-queues the work segment automatically.
+
+### 3. Safety and circuit breakers
+
+- **Compliance:** audit-by-default design retains full lineage (prompt + model version + seed) for every output.
+- **Cost governance:** stop-the-line triggers pause the fleet if quality metrics dip below thresholds or if cost-per-segment exceeds projections.
 
 ---
 
@@ -102,8 +126,7 @@ Current placeholder outputs:
 
 This repository is proprietary.
 
-No license is granted for use, copying, modification, or distribution.
-It is published for evaluation and portfolio demonstration purposes.
+No license is granted for use, copying, modification, or distribution. It is published for evaluation and portfolio demonstration purposes.
 
 See `LICENSE`.
 
@@ -270,10 +293,10 @@ uv run sf clean-artifacts
 
 The orchestrator advances jobs through the pipeline:
 
-- `script:  NEW -> READY`
-- `audio:   NEW -> READY` only when `script=DONE`
+- `script: NEW -> READY`
+- `audio: NEW -> READY` only when `script=DONE`
 - `visuals: NEW -> READY` only when `audio=DONE`
-- `render:  NEW -> READY` only when `visuals=DONE`
+- `render: NEW -> READY` only when `visuals=DONE`
 
 Workers do not advance downstream stages. This keeps transitions deterministic and centralized.
 
@@ -326,22 +349,24 @@ uv run pytest -q -m smoke
 
 ### GitHub Actions workflows
 
-- `CI` runs:
-  - Ruff lint + format checks
-  - `pytest -m "not smoke"`
+CI runs:
 
-- `Smoke (DB)` runs:
-  - Postgres service container
-  - migrations (`alembic upgrade head`)
-  - `pytest -m smoke`
+- Ruff lint + format checks
+- `pytest -m "not smoke"`
 
-  It is triggered manually (`workflow_dispatch`) and also runs on a daily schedule.
+Smoke (DB) runs:
+
+- Postgres service container
+- migrations (`alembic upgrade head`)
+- `pytest -m smoke`
+
+It is triggered manually (`workflow_dispatch`) and also runs on a daily schedule.
 
 ---
 
 ## Project structure
 
-```
+```text
 sleepy_factory/
   cli.py                 # CLI entrypoint, orchestrator/workers, dev runner
   artifacts.py           # artifact helpers + per-job manifest.json
@@ -383,5 +408,4 @@ This repo is deliberately building from the bottom up:
 
 Copyright (c) 2026 ObsidianTroveLLC. All rights reserved.
 
-This repository is proprietary. No license is granted for use, copying, modification, or distribution.
-See `LICENSE`.
+This repository is proprietary. No license is granted for use, copying, modification, or distribution. See `LICENSE`.
